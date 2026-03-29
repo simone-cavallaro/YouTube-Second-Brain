@@ -19,19 +19,11 @@ log = logging.getLogger(__name__)
 # ─── Strategy 1: youtube-transcript-api ──────────────────────────────────────
 
 def fetch_transcript_api(video_id: str) -> str | None:
-    """
-    Fetch transcript from YouTube's caption system.
-    Prefers manually uploaded captions (original language) over auto-generated.
-    Falls back to any auto-generated caption if no manual one exists.
-    """
     try:
-        from youtube_transcript_api import (
-            YouTubeTranscriptApi,
-            TranscriptsDisabled,
-            NoTranscriptFound,
-        )
+        from youtube_transcript_api import YouTubeTranscriptApi
 
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        ytt = YouTubeTranscriptApi()
+        transcript_list = ytt.list(video_id)
         available = list(transcript_list)
 
         if not available:
@@ -48,7 +40,7 @@ def fetch_transcript_api(video_id: str) -> str | None:
         )
 
         snippets = chosen.fetch()
-        full_text = " ".join(s["text"] for s in snippets)
+        full_text = " ".join(s.text for s in snippets)
         return full_text.strip() or None
 
     except Exception as e:
