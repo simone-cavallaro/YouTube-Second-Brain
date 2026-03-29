@@ -1,6 +1,5 @@
-def main():
-    print("Hello from youtube-second-brain!")
-
-
-if __name__ == "__main__":
-    main()
+# Pipeline execution order:
+# 1. python -m pipeline.parse
+# 2. python -m pipeline.metadata
+# 3. python -m pipeline.classify
+# 4. python -m pipeline.transcript
