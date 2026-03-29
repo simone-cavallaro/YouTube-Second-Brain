@@ -104,6 +104,4 @@ if __name__ == "__main__":
     all_videos = load_watch_history(JSON_PATH)
     new_videos = get_new_videos(all_videos, DB_PATH)
 
-    # Test with just the first 50 to save API quota
-    test_batch = new_videos[:50]
-    process_new_videos(test_batch, DB_PATH)
+    process_new_videos(new_videos, DB_PATH)
