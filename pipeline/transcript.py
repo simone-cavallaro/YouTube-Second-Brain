@@ -31,15 +31,36 @@ def fetch_transcript_api(video_id: str) -> str | None:
         if not available:
             return None
 
-        # Prefer manually created (original language) over auto-generated
+        # Language priority: Italian first, then English, then anything else
+        PREFERRED_LANGS = ["it", "en"]
+
         manual = [t for t in available if not t.is_generated]
         auto   = [t for t in available if t.is_generated]
-        chosen = (manual or auto)[0]
 
-        log.info(
-            f"[{video_id}] Using caption: '{chosen.language}' "
-            f"({'manual' if not chosen.is_generated else 'auto-generated'})"
-        )
+        def pick_best(candidates):
+            """Return the best candidate by language priority."""
+            for lang in PREFERRED_LANGS:
+                match = next((t for t in candidates if t.language_code == lang), None)
+                if match:
+                    return match
+            # No preferred language found — return None rather than picking random
+            return None
+
+        # Try manual first, then auto, with language preference
+        chosen = pick_best(manual) or pick_best(auto)
+
+        # Last resort: any manual, then any auto (but log it as suspicious)
+        if chosen is None:
+            chosen = (manual or auto)[0]
+            log.warning(
+                f"[{video_id}] No IT/EN transcript found — using '{chosen.language}' "
+                f"as fallback. Consider reviewing this video."
+            )
+        else:
+            log.info(
+                f"[{video_id}] Using caption: '{chosen.language}' "
+                f"({'manual' if not chosen.is_generated else 'auto-generated'})"
+            )
 
         snippets = chosen.fetch()
         full_text = " ".join(s.text for s in snippets)
