@@ -1,3 +1,5 @@
+import time
+import random
 import sqlite3
 import tempfile
 import os
@@ -134,6 +136,7 @@ def run_transcripts():
         if transcript:
             success_api += 1
             source = "api"
+            time.sleep(random.uniform(1.5, 3.5))  # polite delay — avoids rate limiting
         else:
             # Strategy 2: Whisper — load model on first use
             if whisper_model is None:
