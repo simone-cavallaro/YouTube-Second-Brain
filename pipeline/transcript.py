@@ -1,24 +1,37 @@
-import time
-import random
 import sqlite3
 import tempfile
 import os
+import re
+import time
+import random
 import logging
 
 from dotenv import load_dotenv
-
 load_dotenv(dotenv_path="env/.env")
 
 DB_PATH = "data/second_brain.db"
+COOKIE_FILE = "data/cookies.txt"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 
-# ─── Strategy 1: youtube-transcript-api ──────────────────────────────────────
+# ─── VTT parser ───────────────────────────────────────────────────────────────
+
+def parse_vtt(vtt_text: str) -> str:
+    vtt_text = re.sub(r'WEBVTT.*?\n', '', vtt_text)
+    vtt_text = re.sub(r'NOTE.*?\n\n', '', vtt_text, flags=re.DOTALL)
+    vtt_text = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> .*\n', '', vtt_text)
+    vtt_text = re.sub(r'<[^>]+>', '', vtt_text)
+    lines = [line.strip() for line in vtt_text.splitlines() if line.strip()]
+    deduped = []
+    for line in lines:
+        if not deduped or line != deduped[-1]:
+            deduped.append(line)
+    return " ".join(deduped)
+
+
+# ─── Strategy 1: youtube-transcript-api with cookies ─────────────────────────
 
 def fetch_transcript_api(video_id: str) -> str | None:
     try:
@@ -31,57 +44,83 @@ def fetch_transcript_api(video_id: str) -> str | None:
         if not available:
             return None
 
-        # Language priority: Italian first, then English, then anything else
         PREFERRED_LANGS = ["it", "en"]
 
         manual = [t for t in available if not t.is_generated]
         auto   = [t for t in available if t.is_generated]
 
         def pick_best(candidates):
-            """Return the best candidate by language priority."""
             for lang in PREFERRED_LANGS:
                 match = next((t for t in candidates if t.language_code == lang), None)
                 if match:
                     return match
-            # No preferred language found — return None rather than picking random
             return None
 
-        # Try manual first, then auto, with language preference
         chosen = pick_best(manual) or pick_best(auto)
 
-        # Last resort: any manual, then any auto (but log it as suspicious)
         if chosen is None:
             chosen = (manual or auto)[0]
-            log.warning(
-                f"[{video_id}] No IT/EN transcript found — using '{chosen.language}' "
-                f"as fallback. Consider reviewing this video."
-            )
+            log.warning(f"[{video_id}] No IT/EN transcript — using '{chosen.language}' as fallback")
         else:
-            log.info(
-                f"[{video_id}] Using caption: '{chosen.language}' "
-                f"({'manual' if not chosen.is_generated else 'auto-generated'})"
-            )
+            log.info(f"[{video_id}] Caption: '{chosen.language}' ({'manual' if not chosen.is_generated else 'auto'})")
 
         snippets = chosen.fetch()
         full_text = " ".join(s.text for s in snippets)
         return full_text.strip() or None
 
     except Exception as e:
-        log.warning(f"[{video_id}] youtube-transcript-api failed: {type(e).__name__}: {e}")
+        log.warning(f"[{video_id}] transcript-api failed: {type(e).__name__}: {e}")
         return None
 
 
-# ─── Strategy 2: yt-dlp + Whisper ────────────────────────────────────────────
+# ─── Strategy 2: yt-dlp subtitles (ios client — no JS challenge needed) ──────
 
-def fetch_transcript_whisper(video_id: str, model) -> str | None:
-    """
-    Download audio with yt-dlp, transcribe with Whisper.
-    `model` is a pre-loaded Whisper model instance (loaded once per run).
-    """
+def fetch_transcript_ytdlp(video_id: str) -> str | None:
     try:
         import yt_dlp
     except ImportError:
-        log.error("yt-dlp not installed. Run: uv add yt-dlp")
+        return None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ydl_opts = {
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": ["it", "en"],
+            "subtitlesformat": "vtt",
+            "skip_download": True,
+            "outtmpl": os.path.join(tmpdir, f"{video_id}.%(ext)s"),
+            "extractor_args": {"youtube": {"player_client": ["ios"]}},
+            "quiet": True,
+            "no_warnings": True,
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        except Exception as e:
+            log.warning(f"[{video_id}] yt-dlp subtitle failed: {e}")
+            return None
+
+        for lang in ["it", "en"]:
+            for suffix in [f".{lang}.vtt", f".{lang}-orig.vtt"]:
+                path = os.path.join(tmpdir, f"{video_id}{suffix}")
+                if os.path.exists(path):
+                    with open(path, "r", encoding="utf-8") as f:
+                        raw = f.read()
+                    text = parse_vtt(raw)
+                    if text:
+                        log.info(f"[{video_id}] yt-dlp subtitle ({lang})")
+                        return text
+
+        return None
+
+
+# ─── Strategy 3: yt-dlp audio + Whisper ──────────────────────────────────────
+
+def fetch_transcript_whisper(video_id: str, model) -> str | None:
+    try:
+        import yt_dlp
+    except ImportError:
         return None
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -93,8 +132,9 @@ def fetch_transcript_whisper(video_id: str, model) -> str | None:
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
-                "preferredquality": "64",   # low bitrate is fine for transcription
+                "preferredquality": "64",
             }],
+            "extractor_args": {"youtube": {"player_client": ["ios"]}},
             "quiet": True,
             "no_warnings": True,
         }
@@ -103,22 +143,20 @@ def fetch_transcript_whisper(video_id: str, model) -> str | None:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
         except Exception as e:
-            log.warning(f"[{video_id}] yt-dlp download failed: {e}")
+            log.warning(f"[{video_id}] yt-dlp audio failed: {e}")
             return None
 
         if not os.path.exists(audio_path):
-            log.warning(f"[{video_id}] Audio file not found after download")
             return None
 
         try:
-            log.info(f"[{video_id}] Running Whisper transcription (this may take a minute)...")
+            log.info(f"[{video_id}] Running Whisper...")
             result = model.transcribe(audio_path)
             text = result["text"].strip()
-            detected_lang = result.get("language", "unknown")
-            log.info(f"[{video_id}] Whisper detected language: {detected_lang}")
+            log.info(f"[{video_id}] Whisper done (lang: {result.get('language', '?')})")
             return text or None
         except Exception as e:
-            log.warning(f"[{video_id}] Whisper transcription failed: {e}")
+            log.warning(f"[{video_id}] Whisper failed: {e}")
             return None
 
 
@@ -139,56 +177,56 @@ def run_transcripts():
 
     log.info(f"Fetching transcripts for {len(rows)} videos...")
 
-    # Load Whisper model once — reused for every video that needs it
-    # 'base' runs well on CPU and handles Italian/English accurately.
-    # Upgrade to 'small' for higher accuracy at ~2x the processing time.
-    whisper_model = None
-
+    whisper_model   = None
     success_api     = 0
+    success_ytdlp   = 0
     success_whisper = 0
     skipped         = 0
 
     for video_id, title in rows:
         log.info(f"── {title[:70]}")
 
-        # Strategy 1: caption system
+        # Strategy 1: transcript-api with cookies (fast, reliable for captioned videos)
         transcript = fetch_transcript_api(video_id)
-
         if transcript:
             success_api += 1
             source = "api"
-            time.sleep(random.uniform(1.5, 3.5))  # polite delay — avoids rate limiting
         else:
-            # Strategy 2: Whisper — load model on first use
-            if whisper_model is None:
-                log.info("Loading Whisper model (first time — one-time download ~140MB)...")
-                import whisper
-                whisper_model = whisper.load_model("base")
-
-            transcript = fetch_transcript_whisper(video_id, whisper_model)
-
+            # Strategy 2: yt-dlp ios client subtitles (no JS challenge)
+            transcript = fetch_transcript_ytdlp(video_id)
             if transcript:
-                success_whisper += 1
-                source = "whisper"
+                success_ytdlp += 1
+                source = "yt-dlp"
             else:
-                skipped += 1
-                log.warning(f"[{video_id}] No transcript obtainable — skipping")
-                continue
+                # Strategy 3: Whisper (audio transcription — slowest, most complete)
+                if whisper_model is None:
+                    log.info("Loading Whisper model...")
+                    import whisper
+                    whisper_model = whisper.load_model("base")
 
-        c.execute(
-            "UPDATE videos SET transcript = ? WHERE video_id = ?",
-            (transcript, video_id)
-        )
-        conn.commit()   # commit after each video — crash-safe
+                transcript = fetch_transcript_whisper(video_id, whisper_model)
+                if transcript:
+                    success_whisper += 1
+                    source = "whisper"
+                else:
+                    skipped += 1
+                    log.warning(f"[{video_id}] No transcript obtainable — skipping")
+                    continue
+
+        c.execute("UPDATE videos SET transcript = ? WHERE video_id = ?", (transcript, video_id))
+        conn.commit()
         log.info(f"[{video_id}] Saved ({source}, {len(transcript):,} chars)")
+
+        time.sleep(random.uniform(7.0, 10.0))
 
     conn.close()
 
     print(f"\n── Transcript run complete ──")
-    print(f"   API success  : {success_api}")
-    print(f"   Whisper      : {success_whisper}")
-    print(f"   Skipped      : {skipped}")
-    print(f"   Total        : {len(rows)}")
+    print(f"   API            : {success_api}")
+    print(f"   yt-dlp subs    : {success_ytdlp}")
+    print(f"   Whisper        : {success_whisper}")
+    print(f"   Skipped        : {skipped}")
+    print(f"   Total          : {len(rows)}")
 
 
 if __name__ == "__main__":
